@@ -8,6 +8,9 @@ const FileCopyFlags = Gio.FileCopyFlags;
 const FileTest = GLib.FileTest;
 
 export class Registry {
+    #writing = false;
+    #pendingWrite = null;
+
     constructor ({ settings, uuid }) {
         this.uuid = uuid;
         this.settings = settings;
@@ -44,25 +47,35 @@ export class Registry {
     }
 
     writeToFile (registry) {
-        let json = JSON.stringify(registry);
-        let contents = new GLib.Bytes(json);
+        // Only one write may be in flight. When GIO can't use a temp file
+        // (e.g. hardlinked file, or ownership can't be preserved) it rewrites
+        // the file in place, and two overlapping writes then leave the tail
+        // of the longer one behind the shorter one, corrupting the JSON.
+        // Queued writes are coalesced: only the newest content matters.
+        this.#pendingWrite = JSON.stringify(registry);
+        if (!this.#writing) this.#flushWrite();
+    }
+
+    #flushWrite () {
+        const contents = new GLib.Bytes(this.#pendingWrite);
+        this.#pendingWrite = null;
+        this.#writing = true;
 
         // Make sure dir exists
         GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
 
-        // Write contents to file asynchronously
+        // replace_contents writes all bytes (a single write_bytes call may not)
         let file = Gio.file_new_for_path(this.REGISTRY_PATH);
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE,
-                            GLib.PRIORITY_DEFAULT, null, (obj, res) => {
+        file.replace_contents_bytes_async(contents, null, false,
+                            Gio.FileCreateFlags.NONE, null, (obj, res) => {
+            try {
+                obj.replace_contents_finish(res);
+            } catch (e) {
+                console.error('Clipboard Indicator: failed to write registry file', e);
+            }
 
-            let stream = obj.replace_finish(res);
-
-            stream.write_bytes_async(contents, GLib.PRIORITY_DEFAULT,
-                                null, (w_obj, w_res) => {
-
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
+            this.#writing = false;
+            if (this.#pendingWrite !== null) this.#flushWrite();
         });
     }
 
@@ -96,7 +109,22 @@ export class Registry {
                             if (cacheTextData.trim().length == 0) {
                                 registry = [];
                             } else {
-                                registry = JSON.parse(cacheTextData);
+                                try {
+                                    registry = JSON.parse(cacheTextData);
+                                } catch (e) {
+                                    // A corrupted cache must not leave read() pending forever,
+                                    // otherwise the indicator never finishes starting up.
+                                    console.error('Clipboard Indicator: cache file contains malformed JSON, starting with empty history');
+                                    console.error(e);
+                                    try {
+                                        let destination = Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH);
+                                        file.move(destination, FileCopyFlags.OVERWRITE, null, null);
+                                    } catch (moveError) {
+                                        console.error(moveError);
+                                    }
+                                    resolve([]);
+                                    return;
+                                }
                             }
                             const entriesPromises = registry.map(
                                 jsonEntry => {
@@ -124,10 +152,12 @@ export class Registry {
                                 resolve(clipboardEntries);
                             }).catch(e => {
                                 console.error(e);
+                                resolve([]);
                             });
                         }
                         else {
                             console.error('Clipboard Indicator: failed to open registry file');
+                            resolve([]);
                         }
                     });
                 });
